@@ -1,0 +1,3 @@
+[submodule "external/genomic-FM"]
+	path = external/genomic-FM
+	url = https://github.com/bowang-lab/genomic-FM.git

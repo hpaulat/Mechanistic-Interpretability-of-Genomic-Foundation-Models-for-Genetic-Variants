@@ -59,10 +59,6 @@ print(f"  - model: {MODEL_NAME}")
 print(f"  - device: {device}")
 print(f"  - tokenizer.model_max_length: {tokenizer.model_max_length}")
 
-
-# length of tokens which the input sequences are padded
-max_length = (tokenizer.model_max_length // Seq_length) + 1
-
 # tokenize
 print("\n[5/6] Tokenizing sequences...")
 t0 = time.time()
@@ -78,8 +74,8 @@ enc = tokenizer(
     max_length=Seq_length,
 )
 
-input_ids = enc["input_ids"].to(device)              # (2N, L)
-attention_mask = enc["attention_mask"].to(device)    # (2N, L)
+input_ids = enc["input_ids"]           # (2N, L)
+attention_mask = enc["attention_mask"]   # (2N, L)
 
 print(f"  - total sequences tokenized (REF+ALT): {len(all_sequences)} = {2*n}")
 print(f"  - input_ids shape: {tuple(input_ids.shape)}")
@@ -91,33 +87,44 @@ print(f"  - tokenization done in {time.time() - t0:.2f}s")
 print("\n[6/6] Running model inference and computing pooled embeddings...")
 t0 = time.time()
 
+batch_size = 2
+all_embeds = []
+
+model.eval()
+
 with torch.no_grad():
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-        output_attentions=False,  
-        return_dict=True,
-    )
+    for i in range(0, input_ids.size(0), batch_size):
+        batch_input_ids = input_ids[i:i+batch_size].to(device)
+        batch_mask = attention_mask[i:i+batch_size].to(device)
 
-hidden_states = outputs.hidden_states
-num_layers = len(hidden_states) - 1     # excluding embedding layer
-last_h = hidden_states[-1]              # (2N, L, D)
+        # Optional but recommended: mixed precision on GPU
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model(
+                input_ids=batch_input_ids,
+                attention_mask=batch_mask,
+                output_hidden_states=True,
+                output_attentions=False,
+                return_dict=True,
+            )
 
-print(f"  - number of transformer layers: {num_layers}")
-print(f"  - last hidden state shape: {tuple(last_h.shape)}")
+        last_h = outputs.hidden_states[-1]                 # (B, L, D)
+        mask = batch_mask.unsqueeze(-1).to(last_h.dtype)   # (B, L, 1)
+        pooled = (last_h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)  # (B, D)
 
-# Masked Mean Pooling
-mask = attention_mask.unsqueeze(-1).to(last_h.dtype)      # (2N, L, 1)
-masked_sum = (last_h * mask).sum(dim=1)                   # (2N, D)
-denom = mask.sum(dim=1).clamp(min=1e-9)                   # (2N, 1)
-seq_embeddings = masked_sum / denom                       # (2N, D)
+        all_embeds.append(pooled.float().cpu())  # keep saved embeddings in float32 for stability
 
-# Split back into REF and ALT
+        if (i // batch_size) % 10 == 0:
+            allocated = torch.cuda.memory_allocated() / (1024**3)
+            reserved = torch.cuda.memory_reserved() / (1024**3)
+            print(f"  - batch {i//batch_size:04d} | processed {i+len(batch_input_ids)}/{input_ids.size(0)} "
+                  f"| GPU allocated {allocated:.1f} GiB, reserved {reserved:.1f} GiB")
+            
+seq_embeddings = torch.cat(all_embeds, dim=0)  # (2N, D)      
+
+n = len(lc_reference_sequences)
 ref_seq_embeddings = seq_embeddings[:n]                   # (N, D)
 alt_seq_embeddings = seq_embeddings[n:]                   # (N, D)
 delta_seq_embeddings = alt_seq_embeddings - ref_seq_embeddings
-# and find delta embeddings!
 
 print(f"  - pooled seq embeddings shape (REF): {tuple(ref_seq_embeddings.shape)}")
 print(f"  - pooled seq embeddings shape (ALT): {tuple(alt_seq_embeddings.shape)}")
